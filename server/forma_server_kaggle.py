@@ -1,7 +1,7 @@
 # FORMA Kaggle server. Paste this entire file into ONE Kaggle notebook cell and run it.
 # Download the adapter to /kaggle/working/forma-lora-final before running this cell.
 # Optional Kaggle secret: NGROK_AUTHTOKEN.
-import os, sys, subprocess, time, secrets, threading, asyncio, json, re, base64, io, logging, socket, urllib.request
+import os, sys, subprocess, time, secrets, threading, asyncio, json, re, base64, io, logging, urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -39,7 +39,7 @@ TOKEN=secrets.token_urlsafe(36)
 MAX_NEW_TOKENS=int(os.environ.get("FORMA_MAX_NEW_TOKENS", "1200"))
 REQUEST_TIMEOUT=int(os.environ.get("FORMA_REQUEST_TIMEOUT", "300"))
 MAX_IMAGE_SIDE=512
-MODEL=None; PROCESSOR=None; VLLM_PROCESS=None; VLLM_URL=None
+MODEL=None; PROCESSOR=None
 QUEUE=asyncio.Semaphore(1)
 RATE=defaultdict(deque)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s forma-server %(message)s")
@@ -127,11 +127,6 @@ async def generate(prompt, images, temperature=0.2):
     try: await asyncio.wait_for(QUEUE.acquire(),timeout=REQUEST_TIMEOUT)
     except asyncio.TimeoutError: raise asyncio.TimeoutError("Timed out while waiting for the single inference slot")
     try:
-        if VLLM_URL:
-            import requests
-            data={"model":"forma","temperature":temperature,"max_tokens":MAX_NEW_TOKENS,"messages":[{"role":"user","content":[{"type":"text","text":prompt}]+[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+base64.b64encode(img_to_jpeg(i)).decode()}} for i in images]}]}
-            response=await asyncio.to_thread(requests.post,VLLM_URL+"/v1/chat/completions",json=data,timeout=REQUEST_TIMEOUT)
-            response.raise_for_status(); return response.json()["choices"][0]["message"]["content"]
         return await asyncio.wait_for(asyncio.to_thread(run_transformers,prompt,images,temperature),timeout=REQUEST_TIMEOUT)
     finally: QUEUE.release()
 
@@ -150,7 +145,7 @@ async def secure(request: Request, call_next):
     return await call_next(request)
 
 @app.get("/health")
-async def health(): return {"status":"ok","model":"forma","adapter":Path(ADAPTER).name,"backend":"vllm" if VLLM_URL else "transformers","max_image_side":MAX_IMAGE_SIDE}
+async def health(): return {"status":"ok","model":"forma","adapter":Path(ADAPTER).name,"backend":"transformers","max_image_side":MAX_IMAGE_SIDE}
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
@@ -201,41 +196,6 @@ def wait_http(url, timeout=300, headers=None):
         except Exception: time.sleep(3)
     return False
 
-def start_vllm_ladder():
-    """Try merged fp16/Tensor Parallel 2, then bitsandbytes+LoRA, then return to FastVisionModel."""
-    global VLLM_PROCESS,VLLM_URL
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-    from peft import PeftModel
-    merged="/kaggle/working/forma-merged-fp16"
-    try:
-        log.info("Backend attempt 1/3: merge LoRA into fp16 weights; vLLM tensor parallel size 2")
-        base=Qwen2_5_VLForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct",torch_dtype=torch.float16,device_map="cpu",low_cpu_mem_usage=True)
-        merged_model=PeftModel.from_pretrained(base,ADAPTER).merge_and_unload()
-        merged_model.save_pretrained(merged,safe_serialization=True,max_shard_size="4GB")
-        AutoProcessor.from_pretrained(BASE_ID,trust_remote_code=True).save_pretrained(merged)
-        del merged_model,base; torch.cuda.empty_cache()
-        VLLM_PROCESS=subprocess.Popen([sys.executable,"-m","vllm.entrypoints.openai.api_server","--model",merged,"--served-model-name","forma","--tensor-parallel-size","2","--dtype","half","--max-model-len","4096","--port","8001"],stdout=open("/kaggle/working/vllm.log","w"),stderr=subprocess.STDOUT)
-        if wait_http("http://127.0.0.1:8001/health"): VLLM_URL="http://127.0.0.1:8001";log.info("Backend 1/3 selected: merged fp16 vLLM, TP=2");return True
-        VLLM_PROCESS.kill();VLLM_PROCESS=None
-    except Exception as e:
-        log.warning("Backend attempt 1/3 unavailable: %s",str(e)[:400])
-        if VLLM_PROCESS:
-            try:VLLM_PROCESS.kill()
-            except:pass
-            VLLM_PROCESS=None
-    try:
-        log.info("Backend attempt 2/3: vLLM bitsandbytes 4-bit with LoRA adapter")
-        VLLM_PROCESS=subprocess.Popen([sys.executable,"-m","vllm.entrypoints.openai.api_server","--model",BASE_ID,"--served-model-name","forma","--quantization","bitsandbytes","--enable-lora","--lora-modules",f"forma={ADAPTER}","--max-lora-rank","16","--tensor-parallel-size","2","--dtype","half","--max-model-len","4096","--port","8001"],stdout=open("/kaggle/working/vllm.log","w"),stderr=subprocess.STDOUT)
-        if wait_http("http://127.0.0.1:8001/health"): VLLM_URL="http://127.0.0.1:8001";log.info("Backend 2/3 selected: bnb-4bit vLLM with LoRA");return True
-        VLLM_PROCESS.kill();VLLM_PROCESS=None
-    except Exception as e:
-        log.warning("Backend attempt 2/3 unavailable: %s",str(e)[:400])
-        if VLLM_PROCESS:
-            try:VLLM_PROCESS.kill()
-            except:pass
-            VLLM_PROCESS=None
-    return False
-
 def open_tunnel():
     global TOKEN
     # Cloudflare quick tunnel is primary and needs no account. The random bearer token remains mandatory.
@@ -283,5 +243,5 @@ print("Keep this notebook running. URL changes after restart; Kaggle sessions ar
 print("="*72+"\n")
 while True:
     time.sleep(300)
-    try:print(time.strftime("FORMA heartbeat %Y-%m-%d %H:%M:%S UTC"),"backend=", "vllm" if VLLM_URL else "transformers", "alive=",http_server.started)
+    try:print(time.strftime("FORMA heartbeat %Y-%m-%d %H:%M:%S UTC"),"backend=transformers","alive=",http_server.started)
     except Exception:pass
