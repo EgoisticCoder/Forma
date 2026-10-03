@@ -1,12 +1,13 @@
 # FORMA Kaggle server. Paste this entire file into ONE Kaggle notebook cell and run it.
-# Required Kaggle inputs: forma-lora-final adapter folder. Optional Kaggle secret: NGROK_AUTHTOKEN.
+# Set FORMA_HF_REPO to download the adapter automatically. Private repo: Kaggle secret HF_TOKEN.
+# An attached Kaggle input is also supported as a fallback. Optional secret: NGROK_AUTHTOKEN.
 import os, sys, subprocess, time, secrets, threading, asyncio, json, re, base64, io, logging, socket, urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
 
 def install(*packages): subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *packages])
 
-install("fastapi", "uvicorn[standard]", "transformers>=4.49.0", "peft", "accelerate", "bitsandbytes", "pillow", "qwen-vl-utils", "unsloth")
+install("fastapi", "uvicorn[standard]", "transformers>=4.49.0", "peft", "accelerate", "bitsandbytes", "pillow", "qwen-vl-utils", "unsloth", "huggingface_hub")
 import torch
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException
@@ -15,13 +16,29 @@ import uvicorn
 
 HOST="0.0.0.0"; PORT=8000
 BASE_ID=os.environ.get("FORMA_BASE_MODEL", "unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit")
-ADAPTER=os.environ.get("FORMA_ADAPTER_PATH", "/kaggle/input/forma-lora-final")
-if not Path(ADAPTER).exists():
+HF_REPO=os.environ.get("FORMA_HF_REPO", "").strip()
+ADAPTER=os.environ.get("FORMA_ADAPTER_PATH", "/kaggle/working/forma-lora-final")
+if not Path(ADAPTER, "adapter_config.json").exists() and HF_REPO:
+    from huggingface_hub import snapshot_download
+    hf_token=os.environ.get("HF_TOKEN")
+    if not hf_token:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            hf_token=UserSecretsClient().get_secret("HF_TOKEN")
+        except Exception:
+            hf_token=None
+    print(f"Downloading FORMA adapter from Hugging Face repo {HF_REPO}...")
+    try:
+        snapshot_download(repo_id=HF_REPO, repo_type="model", local_dir=ADAPTER, token=hf_token)
+    except Exception as e:
+        raise RuntimeError(f"Could not download adapter from {HF_REPO}. Check the repo ID, access, and Kaggle HF_TOKEN secret. Details: {str(e)[:300]}") from e
+if not Path(ADAPTER, "adapter_config.json").exists():
     candidates=list(Path("/kaggle/input").glob("**/adapter_config.json"))
     if candidates:
         candidates.sort(key=lambda p:("final" not in str(p.parent).lower(),"checkpoint" in str(p.parent).lower(),str(p)))
         ADAPTER=str(candidates[0].parent)
-if not Path(ADAPTER).exists(): raise FileNotFoundError("Adapter files not found. Add Kaggle input containing forma-lora-final/adapter_config.json or set FORMA_ADAPTER_PATH.")
+if not Path(ADAPTER, "adapter_config.json").exists():
+    raise FileNotFoundError("Adapter files not found. Set FORMA_HF_REPO='username/repo-name' (and Kaggle secret HF_TOKEN for private repos), attach a Kaggle input containing adapter_config.json, or set FORMA_ADAPTER_PATH.")
 TOKEN=secrets.token_urlsafe(36)
 MAX_NEW_TOKENS=int(os.environ.get("FORMA_MAX_NEW_TOKENS", "1200"))
 REQUEST_TIMEOUT=int(os.environ.get("FORMA_REQUEST_TIMEOUT", "300"))

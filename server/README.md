@@ -1,12 +1,12 @@
 # Run FORMA on Kaggle
 
-`forma_server_kaggle.py` is designed to be pasted into a single Kaggle notebook cell. It installs inference/server dependencies, locates the adapter in Kaggle inputs (or uses `FORMA_ADAPTER_PATH`), tries the vLLM backends in priority order, falls back to a Qwen2.5-VL Transformers pipeline, launches an authenticated FastAPI server, creates a tunnel, and prints the API URL and random token.
+`forma_server_kaggle.py` is designed to be pasted into a single Kaggle notebook cell. It installs inference/server dependencies, can download the adapter from Hugging Face, can locate it in Kaggle inputs, tries the vLLM backends in priority order, falls back to a Qwen2.5-VL Transformers pipeline, launches an authenticated FastAPI server, creates a tunnel, and prints the API URL and random token.
 
 ## Notebook setup
 
 1. Create a notebook with the two-T4 GPU accelerator.
-2. Add a Kaggle dataset containing the final adapter folder and its processor/tokenizer files. The default search looks under `/kaggle/input/**/adapter_config.json`.
-3. Paste the complete Python file into one notebook cell and run it. Optional environment settings: `FORMA_ADAPTER_PATH`, `FORMA_BASE_MODEL`, `FORMA_MAX_NEW_TOKENS`, and `FORMA_REQUEST_TIMEOUT`.
+2. For automatic Hugging Face download, set `FORMA_HF_REPO` to your model repo ID; for a private repo, add a Kaggle secret named `HF_TOKEN`. Alternatively, attach the adapter as a Kaggle input. The server searches `/kaggle/input/**/adapter_config.json` as a fallback.
+3. Paste the complete Python file into one notebook cell and run it. Optional settings: `FORMA_HF_REPO`, `FORMA_ADAPTER_PATH`, `FORMA_BASE_MODEL`, `FORMA_MAX_NEW_TOKENS`, and `FORMA_REQUEST_TIMEOUT`.
 4. Cloudflare quick tunnel is attempted first. If it cannot create a tunnel, add `NGROK_AUTHTOKEN` under Kaggle notebook secrets and rerun.
 5. Keep the cell running. Kaggle runtime sessions are time-limited and the URL changes on restart.
 
