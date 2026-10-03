@@ -1,0 +1,54 @@
+name: Build, verify, and package Forma
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:mcp
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Package both npm workspaces
+        run: |
+          mkdir -p release/forma-cli-bundle
+          npm pack --workspace @forma-ai/forma-mcp --pack-destination release/forma-cli-bundle
+          npm pack --workspace @forma-ai/forma --pack-destination release/forma-cli-bundle
+          tar -czf release/forma-cli-bundle.tar.gz -C release forma-cli-bundle
+          (cd release && sha256sum forma-cli-bundle.tar.gz > SHA256SUMS)
+          cd release
+          zip -qr forma-cli-bundle.zip forma-cli-bundle
+          sha256sum forma-cli-bundle.zip >> SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/forma-cli-bundle.tar.gz
+            release/forma-cli-bundle.zip
+            release/SHA256SUMS
+          generate_release_notes: true

@@ -1,0 +1,21 @@
+{
+  "name": "@forma-ai/forma-mcp",
+  "version": "0.1.0",
+  "description": "Browser and visual UI/UX audit tools for Forma and any MCP client",
+  "type": "module",
+  "bin": { "forma-mcp": "dist/src/index.js" },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test": "node --test dist/test/*.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "axe-core": "^4.10.3",
+    "playwright": "^1.55.0",
+    "sharp": "^0.34.3",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.8.0" }
+}
