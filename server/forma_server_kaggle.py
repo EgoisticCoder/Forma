@@ -1,14 +1,25 @@
 # FORMA Kaggle server. Paste this entire file into ONE Kaggle notebook cell and run it.
-# Set FORMA_HF_REPO to download the adapter automatically. Private repo: Kaggle secret HF_TOKEN.
-# An attached Kaggle input is also supported as a fallback. Optional secret: NGROK_AUTHTOKEN.
+# Download the adapter to /kaggle/working/forma-lora-final before running this cell.
+# Optional Kaggle secret: NGROK_AUTHTOKEN.
 import os, sys, subprocess, time, secrets, threading, asyncio, json, re, base64, io, logging, socket, urllib.request
 from collections import defaultdict, deque
 from pathlib import Path
 
 def install(*packages): subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *packages])
 
-install("fastapi", "uvicorn[standard]", "transformers>=4.49.0", "peft", "accelerate", "bitsandbytes", "pillow", "qwen-vl-utils", "unsloth", "huggingface_hub")
+install("fastapi", "uvicorn[standard]", "transformers==4.57.3", "peft==0.19.1", "accelerate", "bitsandbytes", "pillow", "qwen-vl-utils")
 import torch
+# This server uses the Qwen PIL image processor and does not need torchvision.
+# The logged Kaggle image has a broken torchvision binary (missing torchvision::nms).
+try:
+    import torchvision
+    from torchvision.ops import nms as _torchvision_nms
+except Exception:
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "torchvision"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for module_name in list(sys.modules):
+        if module_name == "torchvision" or module_name.startswith("torchvision."):
+            del sys.modules[module_name]
+    print("Removed broken optional torchvision; Transformers will use its PIL image path.")
 from PIL import Image
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -16,29 +27,14 @@ import uvicorn
 
 HOST="0.0.0.0"; PORT=8000
 BASE_ID=os.environ.get("FORMA_BASE_MODEL", "unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit")
-HF_REPO=os.environ.get("FORMA_HF_REPO", "").strip()
 ADAPTER=os.environ.get("FORMA_ADAPTER_PATH", "/kaggle/working/forma-lora-final")
-if not Path(ADAPTER, "adapter_config.json").exists() and HF_REPO:
-    from huggingface_hub import snapshot_download
-    hf_token=os.environ.get("HF_TOKEN")
-    if not hf_token:
-        try:
-            from kaggle_secrets import UserSecretsClient
-            hf_token=UserSecretsClient().get_secret("HF_TOKEN")
-        except Exception:
-            hf_token=None
-    print(f"Downloading FORMA adapter from Hugging Face repo {HF_REPO}...")
-    try:
-        snapshot_download(repo_id=HF_REPO, repo_type="model", local_dir=ADAPTER, token=hf_token)
-    except Exception as e:
-        raise RuntimeError(f"Could not download adapter from {HF_REPO}. Check the repo ID, access, and Kaggle HF_TOKEN secret. Details: {str(e)[:300]}") from e
 if not Path(ADAPTER, "adapter_config.json").exists():
-    candidates=list(Path("/kaggle/input").glob("**/adapter_config.json"))
+    candidates=list(Path("/kaggle/working").glob("**/adapter_config.json"))
     if candidates:
         candidates.sort(key=lambda p:("final" not in str(p.parent).lower(),"checkpoint" in str(p.parent).lower(),str(p)))
         ADAPTER=str(candidates[0].parent)
 if not Path(ADAPTER, "adapter_config.json").exists():
-    raise FileNotFoundError("Adapter files not found. Set FORMA_HF_REPO='username/repo-name' (and Kaggle secret HF_TOKEN for private repos), attach a Kaggle input containing adapter_config.json, or set FORMA_ADAPTER_PATH.")
+    raise FileNotFoundError("Adapter files not found under /kaggle/working. Download the adapter to /kaggle/working/forma-lora-final first, or set FORMA_ADAPTER_PATH to its directory.")
 TOKEN=secrets.token_urlsafe(36)
 MAX_NEW_TOKENS=int(os.environ.get("FORMA_MAX_NEW_TOKENS", "1200"))
 REQUEST_TIMEOUT=int(os.environ.get("FORMA_REQUEST_TIMEOUT", "300"))
@@ -82,21 +78,15 @@ def extract_user(messages):
 
 def load_runtime_model():
     global MODEL, PROCESSOR
-    # Third fallback: the supported Qwen2.5-VL processor / vision-info generation path.
-    try:
-        from unsloth import FastVisionModel
-        MODEL, PROCESSOR=FastVisionModel.from_pretrained(BASE_ID, load_in_4bit=True, max_seq_length=4096, dtype=torch.float16)
-        from peft import PeftModel
-        MODEL=PeftModel.from_pretrained(MODEL, ADAPTER, is_trainable=False)
-        FastVisionModel.for_inference(MODEL)
-        log.info("Serving through Unsloth FastVisionModel with the supplied LoRA adapter")
-    except Exception as unsloth_error:
-        log.warning("FastVisionModel load failed (%s); trying Transformers adapter load", str(unsloth_error)[:350])
-        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-        from peft import PeftModel
-        PROCESSOR=AutoProcessor.from_pretrained(BASE_ID, trust_remote_code=True)
-        base=Qwen2_5_VLForConditionalGeneration.from_pretrained(BASE_ID, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True, low_cpu_mem_usage=True)
-        MODEL=PeftModel.from_pretrained(base, ADAPTER, is_trainable=False).eval()
+    # Keep Kaggle's preinstalled CUDA/Torch stack intact; avoid Unsloth/vLLM installs here.
+    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from peft import PeftModel
+    PROCESSOR=AutoProcessor.from_pretrained(BASE_ID, trust_remote_code=True)
+    base=Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        BASE_ID, torch_dtype=torch.float16, device_map="auto", low_cpu_mem_usage=True
+    )
+    MODEL=PeftModel.from_pretrained(base, ADAPTER, is_trainable=False).eval()
+    log.info("Serving Qwen2.5-VL with Transformers + PEFT; Torch=%s CUDA=%s GPUs=%s", torch.__version__, torch.version.cuda, torch.cuda.device_count())
 
 def run_transformers(prompt, images, temperature):
     from qwen_vl_utils import process_vision_info
@@ -273,15 +263,9 @@ def open_tunnel():
     from pyngrok import ngrok
     ngrok.set_auth_token(ngrok_token); tunnel=ngrok.connect(PORT,"http"); return tunnel.public_url,None
 
-print("Loading FORMA adapter and initializing inference backend...")
-try:
-    install("vllm>=0.8.5")
-    if not start_vllm_ladder():
-        log.warning("vLLM attempts 1 and 2 failed; using FastVisionModel/Transformers backend (attempt 3/3)")
-        load_runtime_model()
-except Exception as e:
-    log.warning("vLLM unavailable (%s); using FastVisionModel/Transformers backend (attempt 3/3)",str(e)[:350])
-    load_runtime_model()
+print("Loading FORMA adapter with the Kaggle CUDA stack...")
+print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda, "GPU count:", torch.cuda.device_count())
+load_runtime_model()
 
 config=uvicorn.Config(app,host=HOST,port=PORT,log_level="info",access_log=False,timeout_keep_alive=30)
 http_server=uvicorn.Server(config)
