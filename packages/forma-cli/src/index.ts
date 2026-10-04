@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { runAgent } from "./agent.js";
 
 const homeConfig = path.join(os.homedir(), ".forma", "config.json");
 type Config = { formaUrl: string; formaToken: string; coding: { provider: string; baseUrl: string; apiKey: string; model: string }; updatedAt: string };
@@ -33,8 +34,8 @@ async function setup(old?: Config) {
   try {
     const formaUrl = (await rl.question(`Kaggle OpenAI-compatible API base URL${old ? ` [${old.formaUrl}]` : ""}: `)).trim() || old?.formaUrl || "";
     const formaToken = (await rl.question(`FORMA bearer token${old ? " [leave blank to keep saved token]" : ""}: `)).trim() || old?.formaToken || "";
-    const provider = (await rl.question(`Coding provider label (openai-compatible / ollama) [${old?.coding.provider || "openai-compatible"}]: `)).trim() || old?.coding.provider || "openai-compatible";
-    const defaultBase = provider === "ollama" ? "http://localhost:11434/v1" : "https://api.openai.com/v1";
+    const provider = (await rl.question(`Coding provider (groq / openai-compatible / ollama) [${old?.coding.provider || "openai-compatible"}]: `)).trim() || old?.coding.provider || "openai-compatible";
+    const defaultBase = provider === "ollama" ? "http://localhost:11434/v1" : provider === "groq" ? "https://api.groq.com/openai/v1" : "https://api.openai.com/v1";
     const baseUrl = (await rl.question(`Coding API base URL [${old?.coding.baseUrl || defaultBase}]: `)).trim() || old?.coding.baseUrl || defaultBase;
     const apiKey = (await rl.question(`Coding API key${old ? " [leave blank to keep saved key]" : ""}: `)).trim() || old?.coding.apiKey || (provider === "ollama" ? "ollama" : "");
     const model = (await rl.question(`Coding model ID [${old?.coding.model || (provider === "ollama" ? "qwen2.5-coder:14b" : "gpt-4.1-mini")}]: `)).trim() || old?.coding.model || (provider === "ollama" ? "qwen2.5-coder:14b" : "gpt-4.1-mini");
@@ -53,7 +54,7 @@ function jsonText(result: any) { const first = result?.content?.find((x: any) =>
 async function callTools<T>(config: Config, cwd: string, action: (call: (name: string, arguments_: Record<string, unknown>) => Promise<any>) => Promise<T>) {
   const mcpEntrypoint = resolveMcpEntrypoint();
   const transport = new StdioClientTransport({ command: process.execPath, args: [mcpEntrypoint], env: { ...process.env, FORMA_PROJECT_ROOT: cwd, FORMA_URL: config.formaUrl, FORMA_TOKEN: config.formaToken, FORMA_CONFIG_PATH:homeConfig } as Record<string,string> });
-  const client = new Client({ name: "forma-cli", version: "0.1.0" }); await client.connect(transport);
+  const client = new Client({ name: "forma-cli", version: "0.2.0" }); await client.connect(transport);
   try { return await action(async (name, arguments_) => jsonText(await client.callTool({ name, arguments: arguments_ }))); }
   finally { await client.close(); }
 }
@@ -122,7 +123,7 @@ async function evaluateFolder(config: Config, folder: string, groundTruth?: stri
 async function main() {
   const command=args[0];
   try {
-    if(command==="--version"||command==="-v"){console.log("forma 0.1.0");return;}
+    if(command==="--version"||command==="-v"){console.log("forma 0.2.0");return;}
     if(command==="config"){const current=await readConfig();if(args[1]==="show"){if(!current)throw new Error("No config exists; run forma config.");console.log(JSON.stringify({...current,formaToken:"[redacted]",coding:{...current.coding,apiKey:"[redacted]"}},null,2));return;}await setup(current);return;}
     if(command==="update"){
       const win=process.platform==="win32";const child=win?spawn("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-Command","iwr -useb https://raw.githubusercontent.com/EgoisticCoder/Forma/main/install.ps1 | iex"],{stdio:"inherit"}):spawn("sh",["-c","curl -fsSL https://raw.githubusercontent.com/EgoisticCoder/Forma/main/install.sh | sh"],{stdio:"inherit"});
@@ -134,15 +135,11 @@ async function main() {
     }
     if(command==="audit"){const url=args[1];if(!url)throw new Error("Usage: forma audit <url>");const config=await requireConfig();const result=await audit(config,url);const paths=await writeAudit(result);console.log(mdReport(result));console.log(`\nSaved ${paths.json} and ${paths.markdown}`);return;}
     if(command==="eval"){const folder=args[1];if(!folder)throw new Error("Usage: forma eval <screenshots-folder> [--ground-truth file.jsonl] [--entries entries.jsonl --labels labels.jsonl]");const value=(flag:string)=>{const i=args.indexOf(flag);return i>=0?args[i+1]:undefined;};const result=await evaluateFolder(await requireConfig(),folder,value("--ground-truth"),value("--entries"),value("--labels"));console.log(JSON.stringify({...result,results:undefined},null,2));return;}
-    if(command==="help"||command==="--help"||command==="-h"){console.log("FORMA — UI-aware coding agent\n\nUsage:\n  forma [--url URL --token TOKEN] [--workspace DIR]\n  forma audit <url>\n  forma eval <screenshots-folder> [--ground-truth file.jsonl] [--entries entries.jsonl --labels labels.jsonl]\n  forma config [show]\n  forma update | uninstall\n\nConfigure a coding model in forma config. FORMA itself is a visual audit tool.");return;}
+    if(command==="help"||command==="--help"||command==="-h"){console.log("FORMA — UI-aware coding agent\n\nUsage:\n  forma [--url URL --token TOKEN] [--workspace DIR]\n  forma audit <url>\n  forma eval <screenshots-folder> [--ground-truth file.jsonl] [--entries entries.jsonl --labels labels.jsonl]\n  forma config [show]\n  forma update | uninstall\n\nInteractive commands: /help /clear /permissions /exit\nFORMA is your visual auditor; your configured coding model edits the project.");return;}
     const urlFlag=args.indexOf("--url"),tokenFlag=args.indexOf("--token"),workspaceFlag=args.indexOf("--workspace");
     let config=await readConfig();if(urlFlag>=0||tokenFlag>=0){if(!config)config={formaUrl:"",formaToken:"",coding:{provider:"openai-compatible",baseUrl:"https://api.openai.com/v1",apiKey:"",model:"gpt-4.1-mini"},updatedAt:new Date().toISOString()};config.formaUrl=urlFlag>=0?args[urlFlag+1]:config.formaUrl;config.formaToken=tokenFlag>=0?args[tokenFlag+1]:config.formaToken;if(!config.formaUrl||!config.formaToken)throw new Error("Both --url and --token are required on first setup.");await health(config);await saveConfig(config);}
     if(!config||!config.formaUrl||!config.formaToken||!config.coding.baseUrl||!config.coding.apiKey||!config.coding.model)config=await setup(config);const cwd=workspaceFlag>=0?path.resolve(args[workspaceFlag+1]):process.cwd();
-    const generated=path.join(os.homedir(),".forma","opencode.json");const mcpEntrypoint=resolveMcpEntrypoint();
-    const agentPrompt="FORMA is your UI/UX vision audit tool, not the coding model. For a visual audit, open the page, capture telemetry and a screenshot, then call forma_audit. That tool constructs the exact training prompt: user_prompt, two newlines, the fixed Browser context header, and JSON telemetry. Keep source code context in your coding-model context; FORMA receives only the training-format screenshot and measured browser context. For requested fixes, explain the diff and ask before editing or running shell commands, then reload, capture a screenshot, call visual_diff, re-audit, and report score deltas. If Kaggle becomes unavailable, tell the user to run 'forma config' in another terminal to update the endpoint; retry without losing this conversation. Never read or transmit .env files or secrets.";
-    const code={ "$schema":"https://opencode.ai/config.json", model:`forma-coding/${config.coding.model}`, provider:{"forma-coding":{name:"FORMA Coding Model",npm:"@ai-sdk/openai-compatible",options:{baseURL:config.coding.baseUrl,apiKey:config.coding.apiKey},models:{[config.coding.model]:{name:config.coding.model,tool_call:true}}}}, mcp:{"forma-browser":{type:"local",command:[process.execPath,mcpEntrypoint],environment:{FORMA_URL:config.formaUrl,FORMA_TOKEN:config.formaToken,FORMA_CONFIG_PATH:homeConfig,FORMA_PROJECT_ROOT:cwd},enabled:true}}, permission:{read:{"**/.env*":"deny","**/secrets/**":"deny","*":"allow"},grep:{"**/.env*":"deny","**/secrets/**":"deny","*":"allow"},edit:"ask",bash:"ask",external_directory:"ask","forma-browser_*":"ask"},default_agent:"build",agent:{build:{prompt:agentPrompt},plan:{prompt:agentPrompt}} };
-    await fs.mkdir(path.dirname(generated),{recursive:true,mode:0o700});await fs.writeFile(generated,JSON.stringify(code,null,2),{mode:0o600});
-    const exe=process.env.FORMA_OPENCODE_BIN||"opencode";const child=spawn(exe,[cwd],{stdio:"inherit",env:{...process.env,OPENCODE_CONFIG:generated,FORMA_URL:config.formaUrl,FORMA_TOKEN:config.formaToken}});child.on("error",e=>{console.error(`Could not start OpenCode (${e.message}). Install the OpenCode CLI or reinstall forma with its bundled runtime.`);process.exitCode=1;});child.on("close",c=>process.exitCode=c||0);
+    await runAgent(config,cwd);
   } catch(error) { console.error(`FORMA: ${error instanceof Error?error.message:String(error)}`); process.exitCode=1; }
 }
 main();

@@ -13,7 +13,7 @@ FORMA targets developers and vibe coders who can get a page running but want a u
 - Runs optional axe-core and Lighthouse checks, plus tools for headings, visual weight, spacing, contrast, computed styles, image tiles, annotations, and visual diffs.
 - Sends a screenshot and the training-compatible browser-context prompt to FORMA, the Qwen2.5-VL adapter. FORMA is an audit tool; it does not coordinate other tools or write code.
 - Leaves coding decisions to the orchestrator you select: a compatible hosted model or a local Ollama model.
-- Keeps the normal coding-agent workflow in OpenCode, including file search/editing, shell, planning, sessions, and context management.
+- Runs as a standalone Node.js terminal agent with file search/editing, shell, planning, sessions, and context management.
 
 The model was trained on single-turn UI/UX audits with images resized to a maximum side of **512 px**. MCP resizes audit images to that same limit. For fine details, use `slice_image` and audit the resulting tiles.
 
@@ -21,7 +21,7 @@ The model was trained on single-turn UI/UX audits with images resized to a maxim
 
 ```mermaid
 flowchart LR
-  A[Developer / IDE] -->|coding and tool calls| B[OpenCode agent host]
+  A[Developer / IDE] -->|coding and tool calls| B[FORMA CLI agent]
   B -->|MCP over stdio| C[forma-mcp browser tools]
   C -->|screenshot + exact prompt + telemetry| D[OpenAI-compatible FORMA API]
   D --> E[Kaggle GPU notebook + tunnel]
@@ -53,13 +53,10 @@ curl -fsSL https://raw.githubusercontent.com/EgoisticCoder/Forma/main/install.sh
 Direct package installation works after the workspaces are published to npm:
 
 ```sh
-npm install --global @forma-ai/forma @forma-ai/forma-mcp opencode-ai
-node "$(npm root --global)/opencode-ai/postinstall.mjs"
+npm install --global @forma-ai/forma @forma-ai/forma-mcp
 ```
 
-The second command completes OpenCode’s platform-binary setup on npm versions that block dependency install scripts by default. The release installer runs that step for you.
-
-On Windows, run `irm https://raw.githubusercontent.com/EgoisticCoder/Forma/main/install.ps1 | iex` in PowerShell. Until the first GitHub Release is published, clone the repository and run `npm install` followed by `npm run build`. Chromium installs the first time browser tools start. Install an OpenAI-compatible coding provider or local Ollama model during setup.
+On Windows, run `irm https://raw.githubusercontent.com/EgoisticCoder/Forma/main/install.ps1 | iex` in PowerShell. Until the first GitHub Release is published, clone the repository and run `npm install` followed by `npm run build:cli`. Chromium installs the first time browser tools start. Choose an OpenAI-compatible coding provider such as Groq/OpenAI or a local Ollama model during setup.
 
 ### 3. Connect and audit
 
@@ -131,7 +128,7 @@ Artifacts are saved under the active project’s `.forma/artifacts/`; reports ar
 
 ## Permissions and privacy
 
-- OpenCode prompts before shell commands, file edits, external-directory access, and Forma MCP tools. Its diff preview is used before applying edits.
+- FORMA asks before shell commands, file edits, and browser MCP tools. It previews diffs before applying edits and supports per-tool allow/deny rules.
 - Browser navigation to localhost/private IP space is blocked until you explicitly opt in.
 - `.env*` and `secrets/` paths are denied to the coding model by default; shell commands still require approval.
 - The Kaggle server requires a random bearer token for every endpoint, closes CORS, rate-limits per IP, and accepts base64 images rather than remote URL fetches.
@@ -148,7 +145,7 @@ The fine-tuned model is a visual auditor, not an autonomous coding model. Screen
 
 - `server/forma_server_kaggle.py` — one-cell Kaggle API server and tunnel bootstrap.
 - `packages/forma-mcp/` — reusable stdio MCP browser and UI/UX tools.
-- `packages/forma-cli/` — `forma` setup/audit/eval wrapper around OpenCode.
+- `packages/forma-cli/` — standalone `forma` agent, setup, audit, and eval commands.
 - `website/` — Vercel landing page for developers and vibe coders.
 - `pitch-deck/` — browser-presentable, printable investor deck and source notes.
 - `docs/` — MCP integration, model summary, and operating guides.

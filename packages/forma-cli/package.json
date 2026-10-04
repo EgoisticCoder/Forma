@@ -1,15 +1,17 @@
 {
   "name": "@forma-ai/forma",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "FORMA: a coding agent with visual UI/UX auditing tools",
   "type": "module",
+  "engines": { "node": ">=20" },
   "bin": { "forma": "dist/index.js" },
-  "files": ["dist", "README.md", "opencode.config.json"],
+  "files": ["dist", "README.md"],
+  "publishConfig": { "access": "public" },
+  "repository": { "type": "git", "url": "https://github.com/EgoisticCoder/Forma.git", "directory": "packages/forma-cli" },
   "scripts": { "build": "tsc -p tsconfig.json", "start": "node dist/index.js" },
   "dependencies": {
-    "@forma-ai/forma-mcp": "^0.1.0",
-    "@modelcontextprotocol/sdk": "^1.17.0",
-    "opencode-ai": "^1.0.0"
+    "@forma-ai/forma-mcp": "^0.2.0",
+    "@modelcontextprotocol/sdk": "^1.17.0"
   },
   "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.8.0" }
 }

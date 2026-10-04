@@ -7,6 +7,7 @@
     "build:cli": "npm run build -w @forma-ai/forma",
     "build:website": "npm run build -w @forma-ai/website",
     "build": "npm run build:mcp && npm run build:cli && npm run build:website",
-    "test:mcp": "npm run test -w @forma-ai/forma-mcp"
+    "test:mcp": "npm run test -w @forma-ai/forma-mcp",
+    "publish:npm": "npm run build:mcp && npm run build:cli && npm publish --workspace @forma-ai/forma-mcp --access public && npm publish --workspace @forma-ai/forma --access public"
   }
 }

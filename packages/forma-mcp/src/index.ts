@@ -14,7 +14,7 @@ import { formatTrainingPrompt } from "./prompt.js";
 
 const projectRoot = process.env.FORMA_PROJECT_ROOT || process.cwd();
 const artifacts = path.resolve(projectRoot, ".forma/artifacts");
-const server = new McpServer({ name: "forma-mcp", version: "0.1.0" });
+const server = new McpServer({ name: "forma-mcp", version: "0.2.0" });
 let browser: Browser | undefined;
 let page: Page | undefined;
 let captured: { console: Array<Record<string, string>>; failed: Array<Record<string, string>>; http: Array<Record<string, unknown>>; crashes: string[] } = { console: [], failed: [], http: [], crashes: [] };
