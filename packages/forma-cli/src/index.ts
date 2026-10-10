@@ -56,7 +56,7 @@ function jsonText(result: any) { const first = result?.content?.find((x: any) =>
 async function callTools<T>(config: Config, cwd: string, action: (call: (name: string, arguments_: Record<string, unknown>) => Promise<any>) => Promise<T>) {
   const mcpEntrypoint = resolveMcpEntrypoint();
   const transport = new StdioClientTransport({ command: process.execPath, args: [mcpEntrypoint], env: { ...process.env, FORMA_PROJECT_ROOT: cwd, FORMA_URL: config.formaUrl, FORMA_TOKEN: config.formaToken, FORMA_CONFIG_PATH:homeConfig } as Record<string,string> });
-  const client = new Client({ name: "forma-cli", version: "0.2.0" }); await client.connect(transport);
+  const client = new Client({ name: "forma-cli", version: "0.3.0" }); await client.connect(transport);
   try {
     return await action(async (name, arguments_) => {
       // MCP SDK defaults to 60s. Browser navigation/screenshot can exceed that,
@@ -153,7 +153,7 @@ async function evaluateFolder(config: Config, folder: string, groundTruth?: stri
 async function main() {
   const command=args[0];
   try {
-    if(command==="--version"||command==="-v"){console.log("forma 0.2.0");return;}
+    if(command==="--version"||command==="-v"){console.log("forma 0.3.0");return;}
     if(command==="config"){const current=await readConfig();if(args[1]==="show"){if(!current)throw new Error("No config exists; run forma config.");console.log(JSON.stringify({...current,formaToken:"[redacted]",coding:{...current.coding,apiKey:"[redacted]"}},null,2));return;}await setup(current);return;}
     if(command==="update"){
       const win=process.platform==="win32";const child=win?spawn("powershell.exe",["-NoProfile","-ExecutionPolicy","Bypass","-Command","iwr -useb https://raw.githubusercontent.com/EgoisticCoder/Forma/main/install.ps1 | iex"],{stdio:"inherit"}):spawn("sh",["-c","curl -fsSL https://raw.githubusercontent.com/EgoisticCoder/Forma/main/install.sh | sh"],{stdio:"inherit"});

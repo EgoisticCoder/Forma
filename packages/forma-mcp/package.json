@@ -1,6 +1,6 @@
 {
   "name": "@forma-ai/forma-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Browser and visual UI/UX audit tools for Forma and any MCP client",
   "type": "module",
   "engines": { "node": ">=20" },

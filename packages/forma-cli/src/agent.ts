@@ -243,7 +243,7 @@ export async function runAgent(config: AgentConfig, cwd: string) {
   const require = createRequire(import.meta.url);
   const serverPath = require.resolve("@forma-ai/forma-mcp/dist/src/index.js");
   const transport = new StdioClientTransport({ command: process.execPath, args: [serverPath], env: { ...process.env, FORMA_PROJECT_ROOT: cwd, FORMA_URL: config.formaUrl, FORMA_TOKEN: config.formaToken } as Record<string, string> });
-  const mcp = new Client({ name: "forma-agent", version: "0.2.0" });
+  const mcp = new Client({ name: "forma-agent", version: "0.3.0" });
   let mcpTools: ToolSpec[] = [];
   try {
     await mcp.connect(transport);
@@ -255,7 +255,7 @@ export async function runAgent(config: AgentConfig, cwd: string) {
   const availableTools = [...tools, ...mcpTools];
   const endpoint = `${config.coding.baseUrl.replace(/\/$/, "")}/chat/completions`;
   const maxTokens = config.coding.provider === "groq" && config.coding.model === "qwen/qwen3.8-27b" ? 8192 : 4096;
-  ui.banner("0.2.0", cwd);
+  ui.banner("0.3.0", cwd);
   console.log(`  ${ui.green("●")} ${ui.bold(config.coding.model)}  ${ui.dim("· coding model")}`);
   console.log(`  ${mcpTools.length ? ui.green("●") : ui.red("●")} ${mcpTools.length} browser MCP tools  ${ui.dim(mcpTools.length ? "· connected" : "· unavailable")}`);
   console.log(`\n${ui.dim("Ask me to change code, debug a project, or inspect a website.")}`);
