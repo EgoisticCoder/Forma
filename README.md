@@ -8,8 +8,8 @@ FORMA targets developers and vibe coders who can get a page running but want a u
 
 ## What it does
 
-- Opens real pages in Chromium at desktop, tablet, and mobile sizes.
-- Captures screenshots, console errors, crashes, failed requests, fonts, overflow, tap-target measurements, image alt coverage, and performance signals.
+- Opens real pages in isolated Chromium at desktop, tablet, and mobile sizes. Headless is the default; `--headed` opens a visible window when requested. It does not use the user's normal browser profile.
+- Reads a compact page/DOM snapshot, captures screenshots, console errors, crashes, failed requests, fonts, overflow, tap-target measurements, image alt coverage, and performance signals. Approved click/type/scroll actions can exercise the page.
 - Runs optional axe-core and Lighthouse checks, plus tools for headings, visual weight, spacing, contrast, computed styles, image tiles, annotations, and visual diffs.
 - Sends a screenshot and the training-compatible browser-context prompt to FORMA, the Qwen2.5-VL adapter. FORMA is an audit tool; it does not coordinate other tools or write code.
 - Leaves coding decisions to the orchestrator you select: a compatible hosted model or a local Ollama model.
@@ -40,7 +40,7 @@ FORMA’s prompt input follows the training row: the `user_prompt` text from `da
 3. Enable the two-T4 GPU accelerator and run the cell. If Cloudflare quick tunnel cannot start, add `NGROK_AUTHTOKEN` as a Kaggle secret for the fallback.
 4. Copy the printed `URL` and `TOKEN`. The URL is the API address; the token is the bearer credential. The URL changes after notebook restarts, and Kaggle sessions are time-limited.
 
-The cell tries these backends in order: merged fp16 weights served by vLLM with tensor parallelism 2; vLLM bnb-4bit plus LoRA; then a FastVisionModel/Transformers generation path. The notebook log names the selected backend and records failed attempts. **Only the non-GPU parts can be checked in a standard development environment; confirm the selected backend on the target Kaggle T4 session.**
+The current cell loads the official Qwen2.5-VL checkpoint with bitsandbytes NF4 4-bit weights and fp16 compute, then attaches the FORMA LoRA adapter. It requires Kaggle's two-T4 GPU runtime. The notebook script and its README describe the current serving path and limits.
 
 ### 2. Install the CLI
 
@@ -75,10 +75,11 @@ forma config
 forma config show   # credentials are redacted
 ```
 
-Run a non-interactive audit and save Markdown plus JSON:
+Run an audit and save Markdown plus JSON. A regular audit uses headless Chromium; use `--headed` when you want the separate browser window displayed, and `--lighthouse` for the slower Lighthouse pass:
 
 ```sh
 forma audit https://example.com
+forma audit https://example.com --headed --lighthouse
 ```
 
 For a local site, FORMA asks before allowing the browser to reach the private host:
@@ -114,12 +115,14 @@ Configure any MCP-compatible coding CLI or IDE to launch `forma-mcp` over stdio 
 
 | Tool | Purpose |
 |---|---|
-| `browser_open` | Navigate to a URL at desktop, tablet, or mobile size; private hosts require opt-in. |
+| `browser_open` | Navigate at desktop, tablet, or mobile size; optional visible Chromium window; private hosts require opt-in. |
+| `page_snapshot`, `browser_click`, `browser_type`, `browser_scroll` | Inspect visible DOM content and, with user approval, interact with page controls. |
 | `screenshot` | Capture full page, viewport, or selector to `.forma/artifacts/`. |
 | `capture_telemetry` | Return the `scrap.py` DevTools report schema. |
 | `console_logs`, `network_failures` | Inspect console, crashes, failed requests, and HTTP errors. |
 | `lighthouse`, `axe_scan` | Run Lighthouse and axe-core. |
 | `dom_hierarchy`, `visual_hierarchy` | Inspect headings, landmarks, reading order, nesting, and visual weight. |
+| `form_scan`, `link_check` | Inspect form names, link labels, destinations, and new-tab protections. |
 | `measure_spacing`, `contrast_scan`, `tap_target_scan`, `computed_styles` | Inspect rhythm, WCAG contrast, control dimensions, and CSS computed values. |
 | `slice_image`, `annotate_image`, `visual_diff` | Tile, annotate, and compare screenshots. |
 | `forma_audit` | Call the protected model with the dataset-format prompt and validate the result. |
@@ -128,7 +131,7 @@ Artifacts are saved under the active project’s `.forma/artifacts/`; reports ar
 
 ## Permissions and privacy
 
-- FORMA asks before shell commands, file edits, and browser MCP tools. It previews diffs before applying edits and supports per-tool allow/deny rules.
+- FORMA asks before shell commands, file edits, and browser MCP tools. It previews diffs before applying edits and supports per-tool allow/deny rules. Click/type/scroll tools can change page state. The visible browser is a separate Playwright Chromium process, not the user's usual browser profile.
 - Browser navigation to localhost/private IP space is blocked until you explicitly opt in.
 - `.env*` and `secrets/` paths are denied to the coding model by default; shell commands still require approval.
 - The Kaggle server requires a random bearer token for every endpoint, closes CORS, rate-limits per IP, and accepts base64 images rather than remote URL fetches.

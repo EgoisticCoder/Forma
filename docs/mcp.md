@@ -42,11 +42,13 @@ Most MCP clients expose equivalent fields for a local command, argument array, a
 }
 ```
 
-For Cursor, Claude Code, VS Code, Windsurf, or another MCP host, copy the general config into that client’s MCP settings and rename `mcpServers` if its schema uses a different key. Set per-tool approval in the client. In particular, require approval for `browser_open`, `forma_audit`, and filesystem-affecting agent tools. FORMA’s MCP server itself only reads browser page state and writes artifacts in the project’s `.forma/artifacts/` directory.
+For Cursor, Claude Code, VS Code, Windsurf, or another MCP host, copy the general config into that client’s MCP settings and rename `mcpServers` if its schema uses a different key. Set per-tool approval in the client. In particular, require approval for browser navigation, `browser_click`, `browser_type`, `browser_scroll`, `forma_audit`, and filesystem-affecting agent tools. Browser interaction tools can change the page. The MCP server writes screenshots and image outputs under the project’s `.forma/artifacts/` directory.
 
 ## URL security
 
-`browser_open` defaults to `allow_private=false` and blocks loopback, local names, and private address ranges. Set `allow_private=true` only when intentionally testing a development server you control. The server also checks each browser request so an allowed public page cannot silently redirect the browser to a private address.
+`browser_open` defaults to `allow_private=false` and `headed=false`; it blocks loopback, local names, and private address ranges. Set `allow_private=true` only when intentionally testing a development server you control. Set `headed=true` to show a separate Playwright Chromium window; it does not attach to the user's normal browser profile. The server also checks each browser request so an allowed public page cannot silently redirect the browser to a private address.
+
+The server can read DOM snapshots, headings, links, forms, console/network errors, accessibility issues, responsive measurements, and screenshots. `browser_click`, `browser_type`, and `browser_scroll` change page state; the MCP host should request user approval before invoking them. The FORMA CLI prompts for every MCP call unless the user saved a per-tool permission rule.
 
 ## Audit prompt contract
 

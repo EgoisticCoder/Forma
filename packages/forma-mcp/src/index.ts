@@ -17,6 +17,7 @@ const artifacts = path.resolve(projectRoot, ".forma/artifacts");
 const server = new McpServer({ name: "forma-mcp", version: "0.2.0" });
 let browser: Browser | undefined;
 let page: Page | undefined;
+let browserHeaded: boolean | undefined;
 let captured: { console: Array<Record<string, string>>; failed: Array<Record<string, string>>; http: Array<Record<string, unknown>>; crashes: string[] } = { console: [], failed: [], http: [], crashes: [] };
 const viewportPresets: Record<string, { width: number; height: number }> = {
   desktop: { width: 1920, height: 1080 }, tablet: { width: 768, height: 1024 }, mobile: { width: 390, height: 854 },
@@ -30,12 +31,17 @@ function safeTelemetryText(value: string) {
   return value.replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[redacted]@").replace(/([?&](?:token|key|api_key|apikey|secret|password|auth)=)[^&#\s]+/gi, "$1[redacted]").replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|Bearer\s+\S+)/gi, "[redacted]").slice(0, 300);
 }
 
-async function ensurePage() {
+async function ensurePage(headed = false) {
+  if (browser && browserHeaded !== headed) {
+    await browser.close();
+    browser = undefined;
+    page = undefined;
+  }
   if (!browser) {
-    try { browser = await chromium.launch({ headless: true }); }
+    try { browser = await chromium.launch({ headless: !headed }); browserHeaded = headed; }
     catch (firstError) {
       if (!/executable|browserType.launch/i.test(String(firstError))) throw firstError;
-      try { await runCommand("npx", ["playwright", "install", "chromium"], projectRoot, 180000); browser = await chromium.launch({ headless: true }); }
+      try { await runCommand("npx", ["playwright", "install", "chromium"], projectRoot, 180000); browser = await chromium.launch({ headless: !headed }); browserHeaded = headed; }
       catch (installError) { throw new Error(`Chromium is not installed and automatic setup failed. Run 'npx playwright install chromium'. ${String(installError).slice(0, 300)}`); }
     }
   }
@@ -64,7 +70,11 @@ async function saveShot(p: Page, name: string, fullPage = false, selector?: stri
   await fs.mkdir(artifacts, { recursive: true });
   const target = path.join(artifacts, `${Date.now()}-${name}.png`);
   const locator = selector ? p.locator(selector).first() : undefined;
-  await (locator || p).screenshot({ path: target, fullPage: !selector && fullPage, animations: "disabled" });
+  // Playwright waits for document.fonts.ready by default. A broken or never-ending
+  // third-party font request can otherwise block captures; this Playwright switch
+  // skips that wait while preserving the page's currently rendered font/fallback.
+  process.env.PW_TEST_SCREENSHOT_NO_FONTS_READY = "1";
+  await (locator || p).screenshot({ path: target, fullPage: !selector && fullPage, animations: "disabled", timeout: 60000 });
   const info = await sharp(target).metadata();
   return { path: target, width: info.width, height: info.height };
 }
@@ -135,11 +145,32 @@ async function captureTelemetry(p: Page) {
 }
 const auditSchema = z.object({ issues: z.array(z.object({ category: z.string(), severity: z.string(), element: z.string(), evidence: z.string(), detail: z.string(), suggestion: z.string() })), scores: z.object({ accessibility: z.number(), typography: z.number(), hierarchy: z.number(), color: z.number(), spacing: z.number(), element_sizing: z.number() }), summary: z.string(), page_type: z.string() });
 
-addTool("browser_open", "Navigate the persistent browser to a public or explicitly opted-in local URL and set a standard viewport.", { url: z.string(), viewport: z.enum(["desktop", "tablet", "mobile"]).default("desktop"), allow_private: z.boolean().default(false) }, async ({ url, viewport, allow_private }) => {
-  const safeUrl = await validateUrl(url, allow_private); const p = await ensurePage(); captured = { console: [], failed: [], http: [], crashes: [] };
+addTool("browser_open", "Open a page in Chromium at a standard viewport. Headless mode is the default; set headed=true to show a visible browser window. Local/private hosts require allow_private=true.", { url: z.string(), viewport: z.enum(["desktop", "tablet", "mobile"]).default("desktop"), allow_private: z.boolean().default(false), headed: z.boolean().default(false) }, async ({ url, viewport, allow_private, headed }) => {
+  const safeUrl = await validateUrl(url, allow_private); const p = await ensurePage(headed); captured = { console: [], failed: [], http: [], crashes: [] };
   (p.context() as any).__formaAllowPrivate = allow_private;
-  await p.setViewportSize(viewportPresets[viewport]); await p.goto(safeUrl, { waitUntil: "domcontentloaded", timeout: 30000 }); await p.waitForTimeout(1200);
-  return { url: p.url(), title: await p.title(), viewport: viewportPresets[viewport], screenshot: await saveShot(p, "browser-open") };
+  await p.setViewportSize(viewportPresets[viewport]);
+  // Some sites keep scripts/analytics busy long enough to miss DOMContentLoaded.
+  // Commit means the response is available; then wait briefly for a usable DOM,
+  // but allow auditing the partially loaded page if that event never arrives.
+  await p.goto(safeUrl, { waitUntil: "commit", timeout: 45000 });
+  let navigationStatus: "complete" | "partial" = "complete";
+  let navigationWarning: string | undefined;
+  try { await p.waitForLoadState("domcontentloaded", { timeout: 15000 }); }
+  catch (error) {
+    navigationStatus = "partial";
+    navigationWarning = `DOMContentLoaded did not fire within 15 seconds; captured the page in its current state (${String(error).slice(0, 180)}).`;
+  }
+  await p.waitForTimeout(1200);
+  return { url: p.url(), title: await p.title().catch(() => ""), viewport: viewportPresets[viewport], browser_mode: headed ? "headed" : "headless", navigation_status: navigationStatus, ...(navigationWarning ? { navigation_warning: navigationWarning } : {}), screenshot: await saveShot(p, "browser-open") };
+});
+addTool("browser_click", "Click one visible page element by a CSS selector. This changes page state and should only be called after user approval.", { selector: z.string().min(1).max(500), timeout_ms: z.number().int().min(1000).max(30000).default(10000) }, async ({ selector, timeout_ms }) => {
+  const p = await ensurePage(), locator = p.locator(selector).first(); await locator.waitFor({ state: "visible", timeout: timeout_ms }); const label = await locator.innerText().catch(() => ""); await locator.click({ timeout: timeout_ms }); return { clicked: selector, label: label.slice(0, 200), url: p.url() };
+});
+addTool("browser_type", "Type text into a visible input or textarea selected by CSS. This changes page state and should only be called after user approval.", { selector: z.string().min(1).max(500), text: z.string().max(4000), clear_first: z.boolean().default(true) }, async ({ selector, text, clear_first }) => {
+  const p = await ensurePage(), locator = p.locator(selector).first(); await locator.waitFor({ state: "visible", timeout: 10000 }); if (clear_first) await locator.fill(text); else await locator.pressSequentially(text); return { typed_into: selector, characters: text.length };
+});
+addTool("browser_scroll", "Scroll the current page by a bounded number of pixels. This changes page state and should only be called after user approval.", { direction: z.enum(["up", "down"]), pixels: z.number().int().min(50).max(3000).default(700) }, async ({ direction, pixels }) => {
+  const p = await ensurePage(); await p.evaluate(({ direction, pixels }) => window.scrollBy({ top: direction === "down" ? pixels : -pixels, behavior: "instant" }), { direction, pixels }); await p.waitForTimeout(250); return { scroll_y: await p.evaluate(() => Math.round(window.scrollY)), direction, pixels };
 });
 addTool("screenshot", "Capture the current page or a selected element under .forma/artifacts.", { viewport: z.enum(["desktop", "tablet", "mobile"]).optional(), full_page: z.boolean().default(false), selector: z.string().optional() }, async ({ viewport, full_page, selector }) => {
   const p = await ensurePage(); if (viewport) await p.setViewportSize(viewportPresets[viewport]);
@@ -161,6 +192,14 @@ addTool("axe_scan", "Run axe-core WCAG checks and group violations by impact.", 
   const grouped: Record<string, unknown[]> = {}; for (const v of result.violations) (grouped[(v as any).impact || "unknown"] ||= []).push(v); return { pass_count: result.passes, violations_by_impact: grouped };
 });
 addTool("dom_hierarchy", "Return heading outline, landmarks, reading order, and maximum DOM nesting depth.", {}, async () => (await ensurePage()).evaluate(() => ({ headings: [...document.querySelectorAll("h1,h2,h3,h4,h5,h6")].map((e, order) => ({ level: Number(e.tagName[1]), text: e.textContent?.trim().slice(0, 180), order })), landmarks: [...document.querySelectorAll("header,nav,main,aside,footer,[role]")].map(e => ({ tag: e.tagName.toLowerCase(), role: e.getAttribute("role") || undefined, label: e.getAttribute("aria-label") || undefined, text: (e.textContent || "").trim().slice(0, 100) })).slice(0, 80), reading_order: [...document.querySelectorAll("h1,h2,h3,h4,h5,h6,main,nav,button,a,p")].slice(0, 80).map(e => ({ tag: e.tagName.toLowerCase(), text: ((e as HTMLElement).innerText || "").trim().replace(/\s+/g, " ").slice(0, 100) })), max_nesting_depth: (() => { let max=0; const walk=(n:Node,d:number)=>{max=Math.max(max,d); for(const c of n.childNodes) walk(c,d+1)}; walk(document.body,0); return max; })() })));
+addTool("page_snapshot", "Read visible page text and a compact listing of headings, landmarks, links, buttons, and form controls.", { max_items: z.number().int().min(10).max(250).default(80) }, async ({ max_items }) => (await ensurePage()).evaluate((limit: number) => {
+  const isVisible = (e: Element) => { const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"; };
+  const label = (e: Element) => ((e as HTMLElement).innerText||e.getAttribute("aria-label")||e.getAttribute("alt")||"").trim().replace(/\s+/g," ").slice(0,180);
+  const sample = (selector: string) => [...document.querySelectorAll(selector)].filter(isVisible).slice(0,limit);
+  return { url:location.href,title:document.title,headings:sample("h1,h2,h3,h4,h5,h6").map(e=>({level:Number(e.tagName[1]),text:label(e)})),landmarks:sample("header,nav,main,aside,footer,[role=main],[role=navigation]").map(e=>({tag:e.tagName.toLowerCase(),label:e.getAttribute("aria-label"),text:label(e).slice(0,120)})),links:sample("a").map(e=>({text:label(e),href:(e as HTMLAnchorElement).href})),buttons:sample("button,[role=button]").map(e=>({text:label(e),disabled:(e as HTMLButtonElement).disabled})),controls:sample("input,textarea,select").map(e=>({tag:e.tagName.toLowerCase(),type:e.getAttribute("type"),label:e.getAttribute("aria-label")||null,placeholder:e.getAttribute("placeholder")})),visible_text:document.body.innerText.replace(/\s+/g," ").slice(0,8000) };
+}, max_items));
+addTool("form_scan", "Inspect visible forms and identify controls that appear to lack an accessible name.", {}, async () => (await ensurePage()).evaluate(() => [...document.querySelectorAll("form")].map((form,index)=>({index,action:(form as HTMLFormElement).action,method:(form as HTMLFormElement).method,controls:[...form.querySelectorAll("input,textarea,select,button")].map((el:any)=>{const label=el.labels?.[0]?.innerText?.trim()||el.getAttribute("aria-label")||el.getAttribute("aria-labelledby")||el.getAttribute("title")||"";return{tag:el.tagName.toLowerCase(),type:el.type||null,name:el.name||null,placeholder:el.placeholder||null,label:label||null,missing_label:!label&&el.type!=="hidden",required:!!el.required}})}))));
+addTool("link_check", "List visible links with missing names, empty destinations, or links that open a new tab without rel protections.", { limit: z.number().int().min(1).max(250).default(120) }, async ({ limit }) => (await ensurePage()).evaluate((limit:number)=>[...document.querySelectorAll("a")].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0}).slice(0,limit).map((e:any)=>{const name=(e.innerText||e.getAttribute("aria-label")||e.getAttribute("title")||e.querySelector("img[alt]")?.getAttribute("alt")||"").trim().replace(/\s+/g," ");const rel=(e.rel||"").split(/\s+/);return{text:name.slice(0,160),href:e.href||null,missing_name:!name,empty_destination:!e.getAttribute("href"),new_tab:e.target==="_blank",missing_noopener:e.target==="_blank"&&!rel.includes("noopener")&&!rel.includes("noreferrer")}}).filter(x=>x.missing_name||x.empty_destination||x.missing_noopener),limit));
 addTool("visual_hierarchy", "Rank visible elements by approximate visual weight from area, contrast, and position.", { limit: z.number().int().min(5).max(100).default(30) }, async ({ limit }) => (await ensurePage()).evaluate((limit:number) => [...document.querySelectorAll("h1,h2,h3,button,a,[role=button],img,section,header,main")].map((e: any) => { const r=e.getBoundingClientRect(),s=getComputedStyle(e); if(r.width<8||r.height<8||r.bottom<0||r.right<0) return null; const area=r.width*r.height, font=parseFloat(s.fontSize)||0, color=s.color, bg=s.backgroundColor; const weight=Math.round(Math.log2(area+1)*4 + font*1.3 + (parseInt(s.fontWeight,10)>500?12:0) + (r.top<innerHeight*.4?10:0)); return { tag:e.tagName.toLowerCase(), text:(e.innerText||e.alt||"").trim().replace(/\s+/g," ").slice(0,100), rect:{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)}, weight, color, background:bg }; }).filter(Boolean).sort((a:any,b:any)=>b.weight-a.weight).slice(0,limit), limit));
 addTool("measure_spacing", "Measure sibling gaps, margins and padding; report deviations from an 8px grid and section rhythm.", { selector: z.string().optional(), limit: z.number().int().min(1).max(100).default(40) }, async ({ selector, limit }) => (await ensurePage()).evaluate(({selector,limit}) => {
   const roots=selector?[...new Set([...document.querySelectorAll(selector)].map(e=>e.parentElement).filter(Boolean))]:[...document.querySelectorAll("main,section,nav,header,footer")];

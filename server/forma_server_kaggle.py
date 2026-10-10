@@ -1,13 +1,13 @@
 # FORMA Kaggle server. Paste this entire file into ONE Kaggle notebook cell and run it.
 # Download the adapter to /kaggle/working/forma-lora-final before running this cell.
 # Optional Kaggle secret: NGROK_AUTHTOKEN.
-import os, sys, subprocess, time, secrets, threading, asyncio, json, re, base64, io, logging, urllib.request
+import os, sys, subprocess, time, secrets, threading, asyncio, json, re, base64, io, logging, urllib.request, urllib.error
 from collections import defaultdict, deque
 from pathlib import Path
 
 def install(*packages): subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *packages])
 
-install("fastapi", "uvicorn[standard]", "transformers==4.57.3", "peft==0.19.1", "accelerate", "bitsandbytes", "pillow", "qwen-vl-utils")
+install("huggingface-hub>=1.16.0,<2.0.0", "transformers>=5.0.0", "peft>=0.14.0", "accelerate>=1.2.0", "bitsandbytes>=0.45.0", "pillow", "qwen-vl-utils", "anyio==4.8.0", "starlette>=0.40.0,<0.47.0", "fastapi>=0.115.0", "uvicorn>=0.34.0")
 import torch
 # This server uses the Qwen PIL image processor and does not need torchvision.
 # The logged Kaggle image has a broken torchvision binary (missing torchvision::nms).
@@ -26,7 +26,12 @@ from fastapi.responses import JSONResponse
 import uvicorn
 
 HOST="0.0.0.0"; PORT=8000
-BASE_ID=os.environ.get("FORMA_BASE_MODEL", "unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit")
+# Keep the official base checkpoint; quantize it during loading. Do not use the
+# pre-quantized Unsloth repo, which previously triggered a LinearFP4 state error.
+BASE_ID=os.environ.get("FORMA_BASE_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
+if "bnb-4bit" in BASE_ID.lower():
+    print("Ignoring the pre-quantized bnb base; using the official Qwen fp16 checkpoint and quantizing it during load.")
+    BASE_ID="Qwen/Qwen2.5-VL-7B-Instruct"
 ADAPTER=os.environ.get("FORMA_ADAPTER_PATH", "/kaggle/working/forma-lora-final")
 if not Path(ADAPTER, "adapter_config.json").exists():
     candidates=list(Path("/kaggle/working").glob("**/adapter_config.json"))
@@ -36,7 +41,7 @@ if not Path(ADAPTER, "adapter_config.json").exists():
 if not Path(ADAPTER, "adapter_config.json").exists():
     raise FileNotFoundError("Adapter files not found under /kaggle/working. Download the adapter to /kaggle/working/forma-lora-final first, or set FORMA_ADAPTER_PATH to its directory.")
 TOKEN=secrets.token_urlsafe(36)
-MAX_NEW_TOKENS=int(os.environ.get("FORMA_MAX_NEW_TOKENS", "1200"))
+MAX_NEW_TOKENS=min(1200, max(1, int(os.environ.get("FORMA_MAX_NEW_TOKENS", "1200"))))
 REQUEST_TIMEOUT=int(os.environ.get("FORMA_REQUEST_TIMEOUT", "300"))
 MAX_IMAGE_SIDE=512
 MODEL=None; PROCESSOR=None
@@ -79,14 +84,43 @@ def extract_user(messages):
 def load_runtime_model():
     global MODEL, PROCESSOR
     # Keep Kaggle's preinstalled CUDA/Torch stack intact; avoid Unsloth/vLLM installs here.
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
     from peft import PeftModel
     PROCESSOR=AutoProcessor.from_pretrained(BASE_ID, trust_remote_code=True)
-    base=Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        BASE_ID, torch_dtype=torch.float16, device_map="auto", low_cpu_mem_usage=True
+    if not torch.cuda.is_available():
+        raise RuntimeError("Kaggle GPU is unavailable. Enable the GPU accelerator and restart the session.")
+    gpu_count=torch.cuda.device_count()
+    if gpu_count < 2:
+        raise RuntimeError("FORMA fp16 serving expects Kaggle's two-T4 GPU accelerator. Select GPU x2 and restart the session.")
+    # Quantize the official weights at load time to leave VRAM for visual and
+    # language attention activations on the two 16 GB Kaggle T4s.
+    quantization_config=BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
     )
-    MODEL=PeftModel.from_pretrained(base, ADAPTER, is_trainable=False).eval()
-    log.info("Serving Qwen2.5-VL with Transformers + PEFT; Torch=%s CUDA=%s GPUs=%s", torch.__version__, torch.version.cuda, torch.cuda.device_count())
+    max_memory={0:"12GiB",1:"12GiB"}
+    torch.cuda.empty_cache()
+    base=Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        BASE_ID,
+        torch_dtype=torch.float16,
+        quantization_config=quantization_config,
+        device_map="auto",
+        max_memory=max_memory,
+        low_cpu_mem_usage=True,
+        attn_implementation="sdpa",
+    )
+    used_map=getattr(base,"hf_device_map",{})
+    if any(str(device) in {"cpu","disk","meta"} for device in used_map.values()):
+        raise RuntimeError(f"Model placement used CPU/disk offload: {used_map}. Restart Kaggle to free both T4s and retry.")
+    MODEL=PeftModel.from_pretrained(base, ADAPTER, is_trainable=False, low_cpu_mem_usage=False).eval()
+    # The Hub checkpoint advertises a long generation max_length. FORMA's
+    # trained response budget is ~1200 new tokens; use that explicitly.
+    if getattr(MODEL, "generation_config", None) is not None:
+        MODEL.generation_config.max_length=20
+        MODEL.generation_config.max_new_tokens=MAX_NEW_TOKENS
+    log.info("Serving official Qwen2.5-VL with on-load NF4 4-bit weights, fp16 compute + FORMA PEFT; Torch=%s CUDA=%s GPUs=%s device_map=%s", torch.__version__, torch.version.cuda, gpu_count, used_map)
 
 def run_transformers(prompt, images, temperature):
     from qwen_vl_utils import process_vision_info
@@ -95,10 +129,13 @@ def run_transformers(prompt, images, temperature):
     rendered=PROCESSOR.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs=process_vision_info(messages)
     inputs=PROCESSOR(text=[rendered], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
-    device=next(MODEL.parameters()).device
+    device=MODEL.get_input_embeddings().weight.device
     inputs={k:(v.to(device) if hasattr(v,"to") else v) for k,v in inputs.items()}
     with torch.inference_mode():
-        output=MODEL.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=temperature>0, temperature=max(0.05,temperature), use_cache=True)
+        generation_kwargs={"max_new_tokens":MAX_NEW_TOKENS,"do_sample":temperature>0,"use_cache":True}
+        if temperature>0:
+            generation_kwargs["temperature"]=max(0.05,temperature)
+        output=MODEL.generate(**inputs, **generation_kwargs)
     new_tokens=output[:, inputs["input_ids"].shape[1]:]
     return PROCESSOR.batch_decode(new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
@@ -133,19 +170,36 @@ async def generate(prompt, images, temperature=0.2):
 def img_to_jpeg(image):
     out=io.BytesIO(); image.save(out,"JPEG",quality=90); return out.getvalue()
 
-@app.middleware("http")
-async def secure(request: Request, call_next):
-    if request.url.path=="/health":
-        if request.headers.get("authorization")!="Bearer "+TOKEN: return JSONResponse({"error":"unauthorized"},status_code=401)
-    elif request.headers.get("authorization")!="Bearer "+TOKEN: return JSONResponse({"error":"unauthorized"},status_code=401)
-    now=time.monotonic(); ip=request.client.host if request.client else "unknown"; q=RATE[ip]
-    while q and now-q[0]>60: q.popleft()
-    if len(q)>=30: return JSONResponse({"error":"rate limit exceeded"},status_code=429)
-    q.append(now)
-    return await call_next(request)
+class SecurityAndRateLimitMiddleware:
+    """Pure ASGI middleware; avoids Starlette BaseHTTPMiddleware/AnyIO TaskGroup."""
+    def __init__(self, asgi_app):
+        self.app=asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"]!="http":
+            await self.app(scope,receive,send)
+            return
+        headers=dict(scope.get("headers",[]))
+        authorization=headers.get(b"authorization",b"").decode("utf-8",errors="ignore")
+        if authorization!="Bearer "+TOKEN:
+            response=JSONResponse({"error":"unauthorized"},status_code=401)
+            await response(scope,receive,send)
+            return
+        client=scope.get("client")
+        ip=client[0] if client else "unknown"
+        now=time.monotonic(); recent=RATE[ip]
+        while recent and now-recent[0]>60: recent.popleft()
+        if len(recent)>=30:
+            response=JSONResponse({"error":"rate limit exceeded"},status_code=429)
+            await response(scope,receive,send)
+            return
+        recent.append(now)
+        await self.app(scope,receive,send)
+
+app.add_middleware(SecurityAndRateLimitMiddleware)
 
 @app.get("/health")
-async def health(): return {"status":"ok","model":"forma","adapter":Path(ADAPTER).name,"backend":"transformers","max_image_side":MAX_IMAGE_SIDE}
+async def health(): return {"status":"ok","model":"forma","adapter":Path(ADAPTER).name,"backend":"transformers-nf4-4bit","max_image_side":MAX_IMAGE_SIDE,"max_new_tokens":MAX_NEW_TOKENS}
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
@@ -193,6 +247,9 @@ def wait_http(url, timeout=300, headers=None):
         try:
             with urllib.request.urlopen(urllib.request.Request(url,headers=headers or {}),timeout=3) as r:
                 if r.status==200: return True
+        except urllib.error.HTTPError as e:
+            body=e.read().decode("utf-8",errors="replace")[:1000]
+            raise RuntimeError(f"FORMA health endpoint returned HTTP {e.code}: {body}") from e
         except Exception: time.sleep(3)
     return False
 
@@ -223,7 +280,7 @@ def open_tunnel():
     from pyngrok import ngrok
     ngrok.set_auth_token(ngrok_token); tunnel=ngrok.connect(PORT,"http"); return tunnel.public_url,None
 
-print("Loading FORMA adapter with the Kaggle CUDA stack...")
+print("Loading FORMA NF4 4-bit model with fp16 compute and LoRA adapter...")
 print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda, "GPU count:", torch.cuda.device_count())
 load_runtime_model()
 
@@ -243,5 +300,5 @@ print("Keep this notebook running. URL changes after restart; Kaggle sessions ar
 print("="*72+"\n")
 while True:
     time.sleep(300)
-    try:print(time.strftime("FORMA heartbeat %Y-%m-%d %H:%M:%S UTC"),"backend=transformers","alive=",http_server.started)
+    try:print(time.strftime("FORMA heartbeat %Y-%m-%d %H:%M:%S UTC"),"backend=transformers-nf4-4bit","alive=",http_server.started)
     except Exception:pass

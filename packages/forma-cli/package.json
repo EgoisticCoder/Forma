@@ -5,7 +5,7 @@
   "type": "module",
   "engines": { "node": ">=20" },
   "bin": { "forma": "dist/index.js" },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "forma-mascot(1).txt", "forma-mascot-mono-amber.svg"],
   "publishConfig": { "access": "public" },
   "repository": { "type": "git", "url": "https://github.com/EgoisticCoder/Forma.git", "directory": "packages/forma-cli" },
   "scripts": { "build": "tsc -p tsconfig.json", "start": "node dist/index.js" },

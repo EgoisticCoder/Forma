@@ -10,7 +10,7 @@
 4. Cloudflare quick tunnel is attempted first. If it cannot create a tunnel, add `NGROK_AUTHTOKEN` under Kaggle notebook secrets and rerun.
 5. Keep the cell running. Kaggle runtime sessions are time-limited and the URL changes on restart.
 
-The inference path loads the Qwen2.5-VL base in fp16 (using the base repo's 4-bit quantization config), attaches the LoRA adapter, and distributes the model with `device_map="auto"`. It uses `apply_chat_template(tokenize=False)`, `qwen_vl_utils.process_vision_info`, processor tensor construction, generation, and decode of new tokens only. It deliberately does not install Unsloth or vLLM because the reported Kaggle runtime's Torch/CUDA versions conflict with the latest wheels.
+The inference path loads the official `Qwen/Qwen2.5-VL-7B-Instruct` checkpoint using bitsandbytes NF4 4-bit quantization with fp16 compute, then attaches the FORMA LoRA adapter. Quantization happens during loading; it does not use the separate pre-quantized Unsloth checkpoint that previously triggered a `LinearFP4` state assertion. This reduces the model's weight memory to leave room for attention activations on Kaggle's two T4 GPUs. Images are resized to 512px. It uses `apply_chat_template(tokenize=False)`, `qwen_vl_utils.process_vision_info`, processor tensor construction, generation (capped at 1200 new tokens), and decodes only new tokens. It deliberately does not install Unsloth or vLLM because the reported Kaggle runtime's Torch/CUDA versions conflict with those wheels.
 
 If the notebook has already run the previous unpinned install cell, restart the Kaggle session before running the updated cell. The old cell replaced Kaggle's Torch/CUDA stack and installed incompatible Transformers/vLLM builds.
 

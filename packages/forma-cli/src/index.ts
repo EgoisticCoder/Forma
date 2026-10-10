@@ -9,13 +9,15 @@ import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { runAgent } from "./agent.js";
+import { ui } from "./ui.js";
 
 const homeConfig = path.join(os.homedir(), ".forma", "config.json");
-type Config = { formaUrl: string; formaToken: string; coding: { provider: string; baseUrl: string; apiKey: string; model: string }; updatedAt: string };
+type Config = { formaUrl: string; formaToken: string; coding: { provider: string; baseUrl: string; apiKey: string; model: string }; ui?: { theme?: string; animations?: boolean; progress?: boolean }; updatedAt: string };
 const args = process.argv.slice(2);
 const require = createRequire(import.meta.url);
+const cliVersion: string = require("../package.json").version;
 function resolveMcpEntrypoint() { return require.resolve("@forma-ai/forma-mcp/dist/src/index.js"); }
-function banner() { console.log("\n  F O R M A   /   VISUAL CODE AUDITOR\n"); }
+function banner() { ui.banner(cliVersion, process.cwd()); }
 async function readConfig(): Promise<Config | undefined> {
   let config: Config | undefined;
   try { config = JSON.parse(await fs.readFile(homeConfig, "utf8")); } catch { }
@@ -40,7 +42,7 @@ async function setup(old?: Config) {
     const apiKey = (await rl.question(`Coding API key${old ? " [leave blank to keep saved key]" : ""}: `)).trim() || old?.coding.apiKey || (provider === "ollama" ? "ollama" : "");
     const model = (await rl.question(`Coding model ID [${old?.coding.model || (provider === "ollama" ? "qwen2.5-coder:14b" : "gpt-4.1-mini")}]: `)).trim() || old?.coding.model || (provider === "ollama" ? "qwen2.5-coder:14b" : "gpt-4.1-mini");
     if (!formaUrl || !formaToken || !baseUrl || !apiKey || !model) throw new Error("Endpoint, token, coding model URL, key, and model ID are required.");
-    const config: Config = { formaUrl: formaUrl.replace(/\/$/, ""), formaToken, coding: { provider, baseUrl: baseUrl.replace(/\/$/, ""), apiKey, model }, updatedAt: new Date().toISOString() };
+    const config: Config = { formaUrl: formaUrl.replace(/\/$/, ""), formaToken, coding: { provider, baseUrl: baseUrl.replace(/\/$/, ""), apiKey, model }, ui: old?.ui || { theme: "forma", animations: true, progress: true }, updatedAt: new Date().toISOString() };
     await health(config); await saveConfig(config); console.log(`\nFORMA endpoint is online. Saved private config to ${homeConfig} (mode 0600).`); return config;
   } finally { rl.close(); }
 }
@@ -55,26 +57,54 @@ async function callTools<T>(config: Config, cwd: string, action: (call: (name: s
   const mcpEntrypoint = resolveMcpEntrypoint();
   const transport = new StdioClientTransport({ command: process.execPath, args: [mcpEntrypoint], env: { ...process.env, FORMA_PROJECT_ROOT: cwd, FORMA_URL: config.formaUrl, FORMA_TOKEN: config.formaToken, FORMA_CONFIG_PATH:homeConfig } as Record<string,string> });
   const client = new Client({ name: "forma-cli", version: "0.2.0" }); await client.connect(transport);
-  try { return await action(async (name, arguments_) => jsonText(await client.callTool({ name, arguments: arguments_ }))); }
+  try {
+    return await action(async (name, arguments_) => {
+      // MCP SDK defaults to 60s. Browser navigation/screenshot can exceed that,
+      // and FORMA inference may retry several times on a Kaggle GPU.
+      const timeout = name === "forma_audit" ? 600_000 : name === "lighthouse" ? 240_000 : 180_000;
+      const result = await client.callTool(
+        { name, arguments: arguments_ },
+        undefined,
+        { timeout, maxTotalTimeout: timeout + 30_000 },
+      );
+      return jsonText(result);
+    });
+  }
   finally { await client.close(); }
 }
 function parseAudit(raw: any) { return raw.parsed || null; }
-async function audit(config: Config, url: string, cwd = process.cwd()) {
+async function audit(config: Config, url: string, cwd = process.cwd(), includeLighthouse = false, headed = false) {
+  ui.configure(config.ui || {});
   return callTools(config, cwd, async call => {
+    const totalSteps = 13 + Number(includeLighthouse); let complete = 0;
+    const step = () => ui.progress("Audit progress", ++complete, totalSteps);
     let opened;
-    try { opened = await call("browser_open", { url, viewport: "desktop", allow_private: false }); }
+    try { opened = await ui.spin("Opening website", () => call("browser_open", { url, viewport: "desktop", allow_private: false, headed })); }
     catch (error) {
       const message=error instanceof Error?error.message:String(error);
       if (!/local\/private|private network/i.test(message)) throw error;
       const rl=createInterface({input,output});
       try { const consent=(await rl.question("This URL resolves to a local/private host. Continue only if this is your own development server? [y/N] ")).trim().toLowerCase(); if(consent!=="y"&&consent!=="yes")throw new Error("Browser navigation cancelled."); }
       finally { rl.close(); }
-      opened = await call("browser_open", { url, viewport: "desktop", allow_private: true });
+      opened = await ui.spin("Opening website", () => call("browser_open", { url, viewport: "desktop", allow_private: true, headed }));
     }
-    const telemetry = await call("capture_telemetry", {});
-    const shot = await call("screenshot", { full_page: true });
-    const report = await call("forma_audit", { image: shot.path, telemetry });
-    return { url: opened.url, screenshot: shot, telemetry, raw: report.raw, audit: parseAudit(report), schema_valid: report.schema_valid };
+    step();
+    const telemetry = await ui.spin("Collecting browser and performance data", () => call("capture_telemetry", {})); step();
+    const diagnostics: Record<string, any> = {};
+    const checks: Array<[string, string]> = [
+      ["page_snapshot", "Reviewing content and information architecture"], ["dom_hierarchy", "Checking headings and landmarks"],
+      ["axe_scan", "Checking accessibility rules"], ["contrast_scan", "Measuring text contrast"], ["tap_target_scan", "Checking touch targets"],
+      ["form_scan", "Reviewing forms and labels"], ["link_check", "Checking link labels and destinations"],
+      ["visual_hierarchy", "Measuring visual hierarchy"], ["measure_spacing", "Measuring layout rhythm"],
+    ];
+    for (const [name, label] of checks) {
+      const options = name === "page_snapshot" ? { max_items: 80 } : name === "visual_hierarchy" ? { limit: 30 } : name === "measure_spacing" ? { limit: 30 } : {};
+      diagnostics[name] = await ui.spin(label, () => call(name, options)); step();
+    }
+    if (includeLighthouse) { diagnostics.lighthouse = await ui.spin("Running Lighthouse", () => call("lighthouse", { url, categories: ["performance", "accessibility", "best-practices", "seo"], allow_private: false })); step(); }
+    const shot = await ui.spin("Capturing full page", () => call("screenshot", { full_page: true })); step();
+    const report = await ui.spin("Generating visual UI/UX review", () => call("forma_audit", { image: shot.path, telemetry })); step();
+    return { url: opened.url, screenshot: shot, telemetry, diagnostics, raw: report.raw, audit: parseAudit(report), schema_valid: report.schema_valid };
   });
 }
 function isLocal(raw: string) { try { const h = new URL(raw).hostname; return h === "localhost" || h.endsWith(".localhost") || h === "127.0.0.1" || h === "::1"; } catch { return false; } }
@@ -133,9 +163,9 @@ async function main() {
       await new Promise<void>((resolve,reject)=>{const p=spawn("npm",["uninstall","--global","@forma-ai/forma","@forma-ai/forma-mcp"],{stdio:"inherit"});p.on("close",c=>c===0?resolve():reject(new Error(`npm uninstall exited ${c}`)));p.on("error",reject);});
       console.log(`Removed Forma packages. Local settings remain at ${homeConfig}; delete ~/.forma if you also want to remove saved credentials.`);return;
     }
-    if(command==="audit"){const url=args[1];if(!url)throw new Error("Usage: forma audit <url>");const config=await requireConfig();const result=await audit(config,url);const paths=await writeAudit(result);console.log(mdReport(result));console.log(`\nSaved ${paths.json} and ${paths.markdown}`);return;}
+    if(command==="audit"){const url=args[1];if(!url)throw new Error("Usage: forma audit <url> [--headed] [--lighthouse]");const config=await requireConfig();const result=await audit(config,url,process.cwd(),args.includes("--lighthouse"),args.includes("--headed"));const paths=await writeAudit(result);console.log(mdReport(result));console.log(`\nSaved ${paths.json} and ${paths.markdown}`);return;}
     if(command==="eval"){const folder=args[1];if(!folder)throw new Error("Usage: forma eval <screenshots-folder> [--ground-truth file.jsonl] [--entries entries.jsonl --labels labels.jsonl]");const value=(flag:string)=>{const i=args.indexOf(flag);return i>=0?args[i+1]:undefined;};const result=await evaluateFolder(await requireConfig(),folder,value("--ground-truth"),value("--entries"),value("--labels"));console.log(JSON.stringify({...result,results:undefined},null,2));return;}
-    if(command==="help"||command==="--help"||command==="-h"){console.log("FORMA — UI-aware coding agent\n\nUsage:\n  forma [--url URL --token TOKEN] [--workspace DIR]\n  forma audit <url>\n  forma eval <screenshots-folder> [--ground-truth file.jsonl] [--entries entries.jsonl --labels labels.jsonl]\n  forma config [show]\n  forma update | uninstall\n\nInteractive commands: /help /clear /permissions /exit\nFORMA is your visual auditor; your configured coding model edits the project.");return;}
+    if(command==="help"||command==="--help"||command==="-h"){console.log("FORMA — UI-aware coding agent\n\nUsage:\n  forma [--url URL --token TOKEN] [--workspace DIR]\n  forma audit <url> [--headed] [--lighthouse]\n  forma eval <screenshots-folder> [--ground-truth file.jsonl] [--entries entries.jsonl --labels labels.jsonl]\n  forma config [show]\n  forma update | uninstall\n\nInteractive commands: /help /clear /status /tools /mcp /theme /settings /model /compact /todos /permissions /exit\nAsk FORMA to show the page in a visible browser, inspect its DOM or console, or operate controls with approval. forma audit opens an isolated Chromium context; --headed displays its window.");return;}
     const urlFlag=args.indexOf("--url"),tokenFlag=args.indexOf("--token"),workspaceFlag=args.indexOf("--workspace");
     let config=await readConfig();if(urlFlag>=0||tokenFlag>=0){if(!config)config={formaUrl:"",formaToken:"",coding:{provider:"openai-compatible",baseUrl:"https://api.openai.com/v1",apiKey:"",model:"gpt-4.1-mini"},updatedAt:new Date().toISOString()};config.formaUrl=urlFlag>=0?args[urlFlag+1]:config.formaUrl;config.formaToken=tokenFlag>=0?args[tokenFlag+1]:config.formaToken;if(!config.formaUrl||!config.formaToken)throw new Error("Both --url and --token are required on first setup.");await health(config);await saveConfig(config);}
     if(!config||!config.formaUrl||!config.formaToken||!config.coding.baseUrl||!config.coding.apiKey||!config.coding.model)config=await setup(config);const cwd=workspaceFlag>=0?path.resolve(args[workspaceFlag+1]):process.cwd();
